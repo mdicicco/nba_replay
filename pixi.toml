@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "nba_stats"
 version = "0.1.0"
 description = "NBA game replay visualization using player tracking data"
