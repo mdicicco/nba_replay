@@ -302,24 +302,34 @@ def find_ball_carrier(
     return None, None
 
 
-def determine_target_hoop(ball_pos: Tuple[float, float, float], quarter: int) -> Tuple[float, float]:
+def determine_target_hoop(
+    offensive_team_id: int, 
+    home_team_id: int, 
+    quarter: int
+) -> Tuple[float, float]:
     """
-    Determine which hoop the offense is attacking based on ball position and quarter.
-    Teams switch sides at halftime (after Q2).
-    """
-    # If ball is in left half, offense is likely attacking right hoop
-    # This is a simplification - in reality we'd track possession more carefully
-    ball_x = ball_pos[0]
+    Determine which hoop the offense is attacking based on team and quarter.
     
-    # Quarters 1,2 vs 3,4 have different orientations
+    Convention:
+    - Home team attacks RIGHT hoop in Q1/Q2 (first half)
+    - Home team attacks LEFT hoop in Q3/Q4 (second half)
+    - Away team always attacks the opposite hoop
+    - Teams switch sides at halftime
+    """
     first_half = quarter <= 2
     
-    if ball_x < COURT_LENGTH / 2:
-        # Ball in left half - attacking right hoop
+    # Home team's target hoop
+    if offensive_team_id == home_team_id:
+        # Home team attacks right in first half, left in second half
         return RIGHT_HOOP if first_half else LEFT_HOOP
     else:
-        # Ball in right half - attacking left hoop
+        # Away team attacks the opposite
         return LEFT_HOOP if first_half else RIGHT_HOOP
+
+
+def get_hoop_for_team(team_id: int, home_team_id: int, quarter: int) -> Tuple[float, float]:
+    """Get which hoop a specific team is attacking."""
+    return determine_target_hoop(team_id, home_team_id, quarter)
 
 
 def analyze_positions(
@@ -345,8 +355,8 @@ def analyze_positions(
     analysis.ball_carrier_pos = moment.player_positions.get(carrier_id, (0, 0))
     analysis.offensive_team_id = offensive_team_id
     
-    # Determine target hoop
-    analysis.target_hoop = determine_target_hoop(ball_pos, moment.quarter)
+    # Determine target hoop based on which team has possession
+    analysis.target_hoop = determine_target_hoop(offensive_team_id, home_team_id, moment.quarter)
     
     # Calculate ball to hoop vector
     analysis.ball_to_hoop = calculate_vector(ball_xy, analysis.target_hoop)
@@ -486,10 +496,10 @@ class SpeedSlider:
         pygame.draw.rect(screen, SLIDER_HANDLE_COLOR, handle_rect, border_radius=4)
         pygame.draw.rect(screen, (255, 255, 255), handle_rect, 2, border_radius=4)
         
-        # Draw current speed label
+        # Draw current speed label - positioned to the right, above the slider
         speed_text = f"Speed: {self.speed}x"
         speed_surface = self.font_large.render(speed_text, True, SCORE_COLOR)
-        screen.blit(speed_surface, (self.x + self.width + 20, self.y + self.height // 2 - 10))
+        screen.blit(speed_surface, (self.x + self.width + 30, self.y - 5))
     
     def handle_event(self, event: pygame.event.Event) -> bool:
         if event.type == pygame.MOUSEBUTTONDOWN:
@@ -820,12 +830,15 @@ class GameRenderer:
         
         # Game state
         self.current_frame = 0
-        self.target_frame = 0
         self.running = True
-        self.animating = False
+        
+        # Playback state: 'stopped', 'forward', 'reverse'
+        self.playback_state = 'stopped'
         
         # Event navigation
         self.current_event_index = -1  # Start before first event
+        self.next_event_frame = 0  # Frame of next event (for forward play)
+        self.prev_event_frame = 0  # Frame of previous event (for reverse play)
         
         # Score tracking
         self.home_score = 0
@@ -845,14 +858,19 @@ class GameRenderer:
         control_y = COURT_HEIGHT_PX + 60
         court_center_x = COURT_WIDTH_PX // 2
         
-        # Next Event button
-        self.next_event_btn = Button(
-            court_center_x - 80, control_y, 160, 40, "Next Event →"
+        # Play/Pause button
+        self.play_btn = Button(
+            court_center_x - 70, control_y, 140, 40, "▶ Play"
         )
         
-        # Previous Event button
-        self.prev_event_btn = Button(
-            court_center_x - 250, control_y, 160, 40, "← Prev Event"
+        # Reverse Play button
+        self.reverse_btn = Button(
+            court_center_x - 220, control_y, 140, 40, "◀ Reverse"
+        )
+        
+        # Stop button
+        self.stop_btn = Button(
+            court_center_x + 80, control_y, 100, 40, "■ Stop"
         )
         
         # Speed slider
@@ -871,6 +889,14 @@ class GameRenderer:
         
         # Minimum distance threshold to consider ball possession changed (in feet)
         self.possession_threshold = 3.0
+        
+        # Ball trail - stores (position, team_id) tuples for colored line trail
+        # Each entry is ((x, y, z), team_id) where team_id is the team with possession at that moment
+        self.ball_trail: deque = deque(maxlen=150)  # Store many positions for long trail
+        
+        # Shot result tracking (simplified - no trajectory)
+        self.showing_shot_result = False
+        self.pending_shot_event: Optional[PlayByPlayEvent] = None
     
     def get_event_description(self, event: PlayByPlayEvent) -> str:
         """Generate a description string for an event."""
@@ -1022,23 +1048,118 @@ class GameRenderer:
         self.current_ball_carrier_id = new_carrier_id
         self.current_ball_carrier_pos = new_carrier_pos
     
-    def go_to_next_event(self):
-        """Navigate to the next event."""
-        if self.current_event_index < len(self.game.events) - 1:
-            self.current_event_index += 1
-            event = self.game.events[self.current_event_index]
-            self.target_frame = event.frame_index
-            self.animating = True
-            self.process_event(event)
+    def find_next_event_frame(self) -> Tuple[int, int]:
+        """Find the next event after current frame. Returns (event_index, frame_index)."""
+        for i, event in enumerate(self.game.events):
+            if event.frame_index > self.current_frame:
+                return i, event.frame_index
+        return len(self.game.events) - 1, len(self.game.moments) - 1
     
-    def go_to_prev_event(self):
-        """Navigate to the previous event."""
-        if self.current_event_index > 0:
-            self.current_event_index -= 1
-            event = self.game.events[self.current_event_index]
-            self.target_frame = event.frame_index
-            self.animating = True
-            # Don't re-process events when going backward
+    def find_prev_event_frame(self) -> Tuple[int, int]:
+        """Find the previous event before current frame. Returns (event_index, frame_index)."""
+        for i in range(len(self.game.events) - 1, -1, -1):
+            if self.game.events[i].frame_index < self.current_frame:
+                return i, self.game.events[i].frame_index
+        return 0, 0
+    
+    def play_forward(self):
+        """Start playing forward until next event."""
+        # If showing shot result, acknowledge and continue
+        if self.showing_shot_result:
+            self.showing_shot_result = False
+            pending_event = self.pending_shot_event
+            self.pending_shot_event = None
+            
+            # Process the event now
+            if pending_event:
+                self.process_event(pending_event)
+                # Move frame to event frame so we don't re-trigger the same event
+                self.current_frame = pending_event.frame_index
+            
+            # Now continue to find the NEXT event after this one
+            # Don't return - fall through to start playing to next event
+        
+        if self.playback_state == 'forward':
+            # Already playing forward - pause
+            self.stop_playback()
+        else:
+            # Find next event
+            next_idx, next_frame = self.find_next_event_frame()
+            if next_frame > self.current_frame:
+                self.current_event_index = next_idx
+                event = self.game.events[next_idx]
+                
+                # Check if this is a shot event - show result when we reach it
+                if event.event_type in [1, 2]:  # Shot made or missed
+                    self.pending_shot_event = event
+                else:
+                    self.pending_shot_event = None
+                
+                self.next_event_frame = next_frame
+                self.playback_state = 'forward'
+                print(f"Playing forward to event {next_idx + 1}")
+    
+    def play_reverse(self):
+        """Start playing in reverse until previous event."""
+        # If showing shot result, dismiss it first
+        if self.showing_shot_result:
+            self.showing_shot_result = False
+            self.pending_shot_event = None
+        
+        if self.playback_state == 'reverse':
+            # Already playing reverse - pause
+            self.stop_playback()
+        else:
+            self.pending_shot_event = None
+            
+            # Find previous event
+            prev_idx, prev_frame = self.find_prev_event_frame()
+            if prev_frame < self.current_frame:
+                self.prev_event_frame = prev_frame
+                self.current_event_index = prev_idx
+                self.playback_state = 'reverse'
+                print(f"Playing reverse to event {prev_idx + 1}")
+    
+    def stop_playback(self):
+        """Stop all playback."""
+        self.playback_state = 'stopped'
+        
+        # Clear pending shot unless we're showing shot result
+        if not self.showing_shot_result:
+            self.pending_shot_event = None
+        
+        # Calculate analysis at current position
+        if self.current_frame < len(self.game.moments):
+            moment = self.game.moments[self.current_frame]
+            self.current_analysis = analyze_positions(
+                moment,
+                self.game.players,
+                self.game.home_team_id,
+                self.game.away_team_id
+            )
+    
+    def on_event_reached(self, event_index: int, direction: str):
+        """Called when playback reaches an event."""
+        if 0 <= event_index < len(self.game.events):
+            event = self.game.events[event_index]
+            
+            # Check if this is a shot event - show result overlay
+            if direction == 'forward' and self.pending_shot_event:
+                self.showing_shot_result = True
+                # Don't process event yet - wait for user to acknowledge
+            else:
+                if direction == 'forward':
+                    self.process_event(event)
+            
+            # Calculate analysis
+            moment = self.game.moments[self.current_frame]
+            self.current_analysis = analyze_positions(
+                moment,
+                self.game.players,
+                self.game.home_team_id,
+                self.game.away_team_id
+            )
+        self.playback_state = 'stopped'
     
     def draw_player(self, player_id: int, x: float, y: float):
         """Draw a player circle with jersey number."""
@@ -1064,11 +1185,23 @@ class GameRenderer:
         self.screen.blit(jersey_text, text_rect)
     
     def draw_ball(self, x: float, y: float, z: float):
-        """Draw the basketball with height indication."""
+        """Draw the basketball with height indication and team color based on possession."""
         screen_pos = court_to_screen(x, y)
         
         # Ball size varies slightly with height for depth perception
         size = int(BALL_RADIUS + min(z * 0.5, 6))
+        
+        # Determine ball color based on possession
+        ball_color = BALL_COLOR  # Default orange
+        ball_outline = BALL_SHADOW
+        if self.current_ball_carrier_id and self.current_ball_carrier_id in self.game.players:
+            carrier = self.game.players[self.current_ball_carrier_id]
+            if carrier.team_id == self.game.home_team_id:
+                ball_color = HOME_COLOR
+                ball_outline = (max(0, HOME_COLOR[0] - 50), max(0, HOME_COLOR[1] - 50), max(0, HOME_COLOR[2] - 50))
+            else:
+                ball_color = AWAY_COLOR
+                ball_outline = (max(0, AWAY_COLOR[0] - 50), max(0, AWAY_COLOR[1] - 50), max(0, AWAY_COLOR[2] - 50))
         
         # Shadow
         shadow_offset = int(z * 0.3)
@@ -1076,14 +1209,14 @@ class GameRenderer:
                           (screen_pos[0] + 3, screen_pos[1] + 3 + shadow_offset), 
                           size - 2)
         
-        # Ball
-        pygame.draw.circle(self.screen, BALL_COLOR, screen_pos, size)
-        pygame.draw.circle(self.screen, BALL_SHADOW, screen_pos, size, 2)
+        # Ball with team color
+        pygame.draw.circle(self.screen, ball_color, screen_pos, size)
+        pygame.draw.circle(self.screen, ball_outline, screen_pos, size, 2)
         
-        # Ball seams for detail
-        pygame.draw.arc(self.screen, (180, 80, 0), 
-                       (screen_pos[0] - size, screen_pos[1] - size, size * 2, size * 2),
-                       0.5, 2.5, 1)
+        # White highlight for visibility
+        pygame.draw.circle(self.screen, (255, 255, 255), 
+                          (screen_pos[0] - size//3, screen_pos[1] - size//3), 
+                          size//3)
     
     def draw_scoreboard(self, moment: Moment):
         """Draw the scoreboard header."""
@@ -1128,25 +1261,42 @@ class GameRenderer:
         # Control area background
         control_top = COURT_HEIGHT_PX + 55
         pygame.draw.rect(self.screen, EVENT_BG_COLOR, 
-                        (0, control_top, WINDOW_WIDTH, WINDOW_HEIGHT - control_top))
+                        (0, control_top, COURT_WIDTH_PX, WINDOW_HEIGHT - control_top))
+        
+        # Update button text based on state
+        if self.showing_shot_result:
+            self.play_btn.text = "▶ Continue"
+        elif self.playback_state == 'forward':
+            self.play_btn.text = "⏸ Pause"
+        else:
+            self.play_btn.text = "▶ Play"
+        
+        if self.playback_state == 'reverse':
+            self.reverse_btn.text = "⏸ Pause"
+        else:
+            self.reverse_btn.text = "◀ Reverse"
         
         # Draw buttons
-        self.prev_event_btn.draw(self.screen)
-        self.next_event_btn.draw(self.screen)
+        self.reverse_btn.draw(self.screen)
+        self.play_btn.draw(self.screen)
+        self.stop_btn.draw(self.screen)
         
         # Draw slider
         self.speed_slider.draw(self.screen)
         
-        # Animation status
-        if self.animating:
-            status = "▶ Playing..."
+        # Playback status - positioned below the buttons, left of the event log
+        if self.playback_state == 'forward':
+            status = "▶ Playing forward..."
             status_color = (100, 255, 100)
+        elif self.playback_state == 'reverse':
+            status = "◀ Playing reverse..."
+            status_color = (100, 200, 255)
         else:
-            status = "⏸ Paused - Click 'Next Event' to advance"
+            status = "⏹ Stopped - Press Play or Reverse"
             status_color = (255, 200, 100)
         
         status_text = self.font_small.render(status, True, status_color)
-        self.screen.blit(status_text, (WINDOW_WIDTH // 2 + 100, COURT_HEIGHT_PX + 70))
+        self.screen.blit(status_text, (50, COURT_HEIGHT_PX + 185))
     
     def draw_event_log(self):
         """Draw the rolling event log with most recent at top."""
@@ -1175,12 +1325,101 @@ class GameRenderer:
             self.screen.blit(text_surface, (450, y_offset))
             y_offset += 20
     
+    def draw_ball_trail(self):
+        """Draw a line trail behind the ball showing its path, colored by possession."""
+        if len(self.ball_trail) < 2:
+            return
+        
+        # Draw trail in segments, changing color when possession changes
+        trail_list = list(self.ball_trail)
+        
+        current_segment = []
+        current_team = trail_list[0][1]  # team_id from first entry
+        
+        for pos, team_id in trail_list:
+            screen_pos = court_to_screen(pos[0], pos[1])
+            
+            if team_id != current_team:
+                # Team changed - draw current segment and start new one
+                if len(current_segment) >= 2:
+                    # Get color for current team
+                    if current_team == self.game.home_team_id:
+                        color = HOME_COLOR
+                    elif current_team == self.game.away_team_id:
+                        color = AWAY_COLOR
+                    else:
+                        color = BALL_COLOR  # No possession - orange
+                    pygame.draw.lines(self.screen, color, False, current_segment, 2)
+                
+                # Start new segment (include last point of previous for continuity)
+                current_segment = [current_segment[-1]] if current_segment else []
+                current_segment.append(screen_pos)
+                current_team = team_id
+            else:
+                current_segment.append(screen_pos)
+        
+        # Draw final segment
+        if len(current_segment) >= 2:
+            if current_team == self.game.home_team_id:
+                color = HOME_COLOR
+            elif current_team == self.game.away_team_id:
+                color = AWAY_COLOR
+            else:
+                color = BALL_COLOR
+            pygame.draw.lines(self.screen, color, False, current_segment, 2)
+    
+    def draw_pending_shot_info(self):
+        """Draw info about the pending shot event."""
+        if not self.showing_shot_result or not self.pending_shot_event:
+            return
+        
+        event = self.pending_shot_event
+        
+        # Determine result
+        if event.event_type == 1:
+            result_text = "SHOT MADE!"
+            result_color = (100, 255, 100)
+        else:
+            result_text = "SHOT MISSED"
+            result_color = (255, 100, 100)
+        
+        # Get description
+        desc = self.get_event_description(event)
+        
+        # Draw overlay box
+        box_width = 500
+        box_height = 120
+        box_x = (COURT_WIDTH_PX - box_width) // 2
+        box_y = COURT_HEIGHT_PX // 2 - box_height // 2
+        
+        pygame.draw.rect(self.screen, (20, 25, 40), 
+                        (box_x, box_y, box_width, box_height), border_radius=15)
+        pygame.draw.rect(self.screen, result_color, 
+                        (box_x, box_y, box_width, box_height), 4, border_radius=15)
+        
+        # Result text
+        result_surface = self.font_large.render(result_text, True, result_color)
+        result_rect = result_surface.get_rect(center=(box_x + box_width // 2, box_y + 30))
+        self.screen.blit(result_surface, result_rect)
+        
+        # Description
+        if desc:
+            desc_surface = self.font_small.render(desc[:60], True, TEXT_COLOR)
+            desc_rect = desc_surface.get_rect(center=(box_x + box_width // 2, box_y + 65))
+            self.screen.blit(desc_surface, desc_rect)
+        
+        # Instruction
+        instr_text = "Press SPACE or Play to continue"
+        instr_surface = self.font_tiny.render(instr_text, True, (150, 150, 150))
+        instr_rect = instr_surface.get_rect(center=(box_x + box_width // 2, box_y + 95))
+        self.screen.blit(instr_surface, instr_rect)
+    
     def draw_shot_celebration(self):
         """Draw shot made celebration overlay."""
         if self.shot_display_timer > 0:
             # Draw text with glow effect
             text = self.font_large.render(self.shot_display_text, True, SCORE_COLOR)
-            text_rect = text.get_rect(center=(WINDOW_WIDTH // 2, COURT_HEIGHT_PX // 2))
+            text_rect = text.get_rect(center=(COURT_WIDTH_PX // 2, COURT_HEIGHT_PX // 2))
             
             # Background box
             bg_rect = text_rect.inflate(40, 20)
@@ -1467,9 +1706,12 @@ class GameRenderer:
     def run(self):
         """Main game loop."""
         print("Starting game replay...")
-        print("Click 'Next Event' to advance through the game")
+        print("Controls:")
+        print("  SPACE or → : Play forward to next event")
+        print("  ← : Play reverse to previous event")
+        print("  S : Stop playback")
+        print("  Q : Quit")
         print("Use the speed slider to adjust playback speed")
-        print("Press Q to quit")
         
         while self.running and self.current_frame < len(self.game.moments):
             # Event handling
@@ -1480,47 +1722,65 @@ class GameRenderer:
                     if event.key == pygame.K_q:
                         self.running = False
                     elif event.key == pygame.K_RIGHT or event.key == pygame.K_SPACE:
-                        self.go_to_next_event()
+                        self.play_forward()
                     elif event.key == pygame.K_LEFT:
-                        self.go_to_prev_event()
+                        self.play_reverse()
+                    elif event.key == pygame.K_s:
+                        self.stop_playback()
                 
                 # Handle button clicks
-                if self.next_event_btn.handle_event(event):
-                    self.go_to_next_event()
-                if self.prev_event_btn.handle_event(event):
-                    self.go_to_prev_event()
+                if self.play_btn.handle_event(event):
+                    self.play_forward()
+                if self.reverse_btn.handle_event(event):
+                    self.play_reverse()
+                if self.stop_btn.handle_event(event):
+                    self.stop_playback()
                 
                 # Handle slider
                 self.speed_slider.handle_event(event)
             
-            # Animation logic
-            if self.animating:
+            # Playback logic
+            if self.playback_state == 'forward':
                 speed = self.speed_slider.speed
+                step = max(1, int(speed * 2))  # Frames to advance per tick
                 
-                if self.current_frame < self.target_frame:
-                    # Moving forward
-                    step = max(1, int(speed * 2))  # Frames to advance per tick
-                    self.current_frame = min(self.current_frame + step, self.target_frame)
+                self.current_frame = min(self.current_frame + step, len(self.game.moments) - 1)
+                
+                # Track ball carrier during playback to detect passes
+                moment = self.game.moments[self.current_frame]
+                self.update_ball_carrier(moment)
+                
+                # Add ball position to trail with current possessing team
+                team_id = None
+                if self.current_ball_carrier_id and self.current_ball_carrier_id in self.game.players:
+                    team_id = self.game.players[self.current_ball_carrier_id].team_id
+                self.ball_trail.append((moment.ball_pos, team_id))
+                
+                # Check if we reached the next event
+                if self.current_frame >= self.next_event_frame:
+                    self.current_frame = self.next_event_frame
+                    self.on_event_reached(self.current_event_index, 'forward')
                     
-                    # Track ball carrier during animation to detect passes
-                    moment = self.game.moments[self.current_frame]
-                    self.update_ball_carrier(moment)
-                    
-                elif self.current_frame > self.target_frame:
-                    # Moving backward
-                    step = max(1, int(speed * 2))
-                    self.current_frame = max(self.current_frame - step, self.target_frame)
-                else:
-                    # Reached target - calculate position analysis
-                    self.animating = False
-                    moment = self.game.moments[self.current_frame]
-                    self.update_ball_carrier(moment)  # Final update
-                    self.current_analysis = analyze_positions(
-                        moment, 
-                        self.game.players,
-                        self.game.home_team_id,
-                        self.game.away_team_id
-                    )
+            elif self.playback_state == 'reverse':
+                speed = self.speed_slider.speed
+                step = max(1, int(speed * 2))
+                
+                self.current_frame = max(self.current_frame - step, 0)
+                
+                # Add ball position to trail (in reverse too for visual effect)
+                moment = self.game.moments[self.current_frame]
+                self.update_ball_carrier(moment)
+                
+                # Add with current possessing team
+                team_id = None
+                if self.current_ball_carrier_id and self.current_ball_carrier_id in self.game.players:
+                    team_id = self.game.players[self.current_ball_carrier_id].team_id
+                self.ball_trail.append((moment.ball_pos, team_id))
+                
+                # Check if we reached the previous event
+                if self.current_frame <= self.prev_event_frame:
+                    self.current_frame = self.prev_event_frame
+                    self.on_event_reached(self.current_event_index, 'reverse')
             
             # Ensure frame is valid
             self.current_frame = max(0, min(self.current_frame, len(self.game.moments) - 1))
@@ -1537,21 +1797,56 @@ class GameRenderer:
             for player_id, (x, y) in moment.player_positions.items():
                 self.draw_player(player_id, x, y)
             
+            # Draw ball trail (comet effect) before the ball
+            self.draw_ball_trail()
+            
             # Draw ball
             bx, by, bz = moment.ball_pos
             self.draw_ball(bx, by, bz)
             
-            # Draw centroids and analysis overlays on court
-            if self.current_analysis and not self.animating:
+            # ===== ALWAYS DRAW TEAM HOOPS =====
+            # Home team hoop (based on quarter)
+            home_hoop = get_hoop_for_team(self.game.home_team_id, self.game.home_team_id, moment.quarter)
+            away_hoop = get_hoop_for_team(self.game.away_team_id, self.game.home_team_id, moment.quarter)
+            
+            home_hoop_screen = court_to_screen(*home_hoop)
+            away_hoop_screen = court_to_screen(*away_hoop)
+            
+            # Draw home team hoop (red)
+            pygame.draw.circle(self.screen, HOME_COLOR, home_hoop_screen, 16, 3)
+            # Draw away team hoop (blue)
+            pygame.draw.circle(self.screen, AWAY_COLOR, away_hoop_screen, 16, 3)
+            
+            # ===== POSSESSION INDICATORS (always on during play) =====
+            # Draw line from ball carrier to ball when someone has possession
+            if self.current_ball_carrier_id and self.current_ball_carrier_pos:
+                ball_xy = (moment.ball_pos[0], moment.ball_pos[1])
+                carrier_screen = court_to_screen(*self.current_ball_carrier_pos)
+                ball_screen = court_to_screen(*ball_xy)
+                
+                # Only draw if ball is close (possession)
+                ball_dist = calculate_distance(self.current_ball_carrier_pos, ball_xy)
+                if ball_dist < self.possession_threshold * 2:
+                    # Get team color for the carrier
+                    if self.current_ball_carrier_id in self.game.players:
+                        carrier = self.game.players[self.current_ball_carrier_id]
+                        carrier_color = HOME_COLOR if carrier.team_id == self.game.home_team_id else AWAY_COLOR
+                        
+                        # Draw possession indicator line
+                        pygame.draw.line(self.screen, carrier_color, carrier_screen, ball_screen, 3)
+                        
+                        # Highlight the target hoop for the offensive team
+                        target_hoop = get_hoop_for_team(carrier.team_id, self.game.home_team_id, moment.quarter)
+                        target_hoop_screen = court_to_screen(*target_hoop)
+                        
+                        # Draw bright highlight ring on target hoop
+                        pygame.draw.circle(self.screen, carrier_color, target_hoop_screen, 22, 5)
+                        pygame.draw.circle(self.screen, (255, 255, 255), target_hoop_screen, 14, 2)
+            
+            # ===== STOPPED STATE OVERLAYS =====
+            if self.current_analysis and self.playback_state == 'stopped':
                 # Get team colors
                 off_color, def_color = self.get_team_colors(self.current_analysis)
-                
-                # Draw target hoop with offensive team color
-                if self.current_analysis.target_hoop:
-                    hoop_screen = court_to_screen(*self.current_analysis.target_hoop)
-                    # Draw colored ring around target hoop
-                    pygame.draw.circle(self.screen, off_color, hoop_screen, 18, 4)
-                    pygame.draw.circle(self.screen, (255, 255, 255), hoop_screen, 12, 2)
                 
                 # Offensive centroid - circle with crosshair (team color)
                 if self.current_analysis.offensive_centroid != (0, 0):
@@ -1573,11 +1868,13 @@ class GameRenderer:
                     hoop_screen = court_to_screen(*self.current_analysis.target_hoop)
                     pygame.draw.line(self.screen, off_color, carrier_screen, hoop_screen, 2)
             
+            
             # Draw UI
             self.draw_scoreboard(moment)
             self.draw_controls()
             self.draw_event_log()
             self.draw_shot_celebration()
+            self.draw_pending_shot_info()
             self.draw_analysis_panel()
             
             # Update display
